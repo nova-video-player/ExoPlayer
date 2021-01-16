@@ -15,7 +15,7 @@
  */
 package com.google.android.exoplayer2.ui;
 
-import android.annotation.TargetApi;
+import android.animation.ValueAnimator;
 import android.content.Context;
 import android.content.res.Resources;
 import android.content.res.TypedArray;
@@ -54,8 +54,6 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
  * <h3>Attributes</h3>
  *
  * The following attributes can be set on a DefaultTimeBar when used in a layout XML file:
- *
- * <p>
  *
  * <ul>
  *   <li><b>{@code bar_height}</b> - Dimension for the height of the time bar.
@@ -154,6 +152,15 @@ public class DefaultTimeBar extends View implements TimeBar {
   /** Default color for played ad markers. */
   public static final int DEFAULT_PLAYED_AD_MARKER_COLOR = 0x33FFFF00;
 
+  // LINT.IfChange
+  /** Vertical gravity for progress bar to be located at the center in the view. */
+  public static final int BAR_GRAVITY_CENTER = 0;
+  /** Vertical gravity for progress bar to be located at the bottom in the view. */
+  public static final int BAR_GRAVITY_BOTTOM = 1;
+  /** Vertical gravity for progress bar to be located at the top in the view. */
+  public static final int BAR_GRAVITY_TOP = 2;
+  // LINT.ThenChange(../../../../../../../../../ui/src/main/res/values/attrs.xml)
+
   /** The threshold in dps above the bar at which touch events trigger fine scrub mode. */
   private static final int FINE_SCRUB_Y_THRESHOLD_DP = -50;
   /** The ratio by which times are reduced in fine scrub mode. */
@@ -165,6 +172,9 @@ public class DefaultTimeBar extends View implements TimeBar {
   private static final long STOP_SCRUBBING_TIMEOUT_MS = 1000;
 
   private static final int DEFAULT_INCREMENT_COUNT = 20;
+
+  private static final float SHOWN_SCRUBBER_SCALE = 1.0f;
+  private static final float HIDDEN_SCRUBBER_SCALE = 0.0f;
 
   /**
    * The name of the Android SDK view that most closely resembles this custom view. Used as the
@@ -185,6 +195,7 @@ public class DefaultTimeBar extends View implements TimeBar {
   @Nullable private final Drawable scrubberDrawable;
   private final int barHeight;
   private final int touchTargetHeight;
+  private final int barGravity;
   private final int adMarkerWidth;
   private final int scrubberEnabledSize;
   private final int scrubberDisabledSize;
@@ -195,15 +206,16 @@ public class DefaultTimeBar extends View implements TimeBar {
   private final Formatter formatter;
   private final Runnable stopScrubbingRunnable;
   private final CopyOnWriteArraySet<OnScrubListener> listeners;
-  private final int[] locationOnScreen;
   private final Point touchPosition;
   private final float density;
 
   private int keyCountIncrement;
   private long keyTimeIncrement;
   private int lastCoarseScrubXPosition;
-  @MonotonicNonNull private Rect lastExclusionRectangle;
+  private @MonotonicNonNull Rect lastExclusionRectangle;
 
+  private ValueAnimator scrubberScalingAnimator;
+  private float scrubberScale;
   private boolean scrubbing;
   private long scrubPosition;
   private long duration;
@@ -225,17 +237,22 @@ public class DefaultTimeBar extends View implements TimeBar {
     this(context, attrs, defStyleAttr, attrs);
   }
 
-  // Suppress warnings due to usage of View methods in the constructor.
-  // the constructor does not initialize fields: adGroupTimesMs, playedAdGroups
-  @SuppressWarnings({
-    "nullness:method.invocation.invalid",
-    "nullness:initialization.fields.uninitialized"
-  })
   public DefaultTimeBar(
       Context context,
       @Nullable AttributeSet attrs,
       int defStyleAttr,
       @Nullable AttributeSet timebarAttrs) {
+    this(context, attrs, defStyleAttr, timebarAttrs, 0);
+  }
+
+  // Suppress warnings due to usage of View methods in the constructor.
+  @SuppressWarnings("nullness:method.invocation.invalid")
+  public DefaultTimeBar(
+      Context context,
+      @Nullable AttributeSet attrs,
+      int defStyleAttr,
+      @Nullable AttributeSet timebarAttrs,
+      int defStyleRes) {
     super(context, attrs, defStyleAttr);
     seekBounds = new Rect();
     progressBar = new Rect();
@@ -249,7 +266,6 @@ public class DefaultTimeBar extends View implements TimeBar {
     scrubberPaint = new Paint();
     scrubberPaint.setAntiAlias(true);
     listeners = new CopyOnWriteArraySet<>();
-    locationOnScreen = new int[2];
     touchPosition = new Point();
 
     // Calculate the dimensions and paints for drawn elements.
@@ -265,7 +281,10 @@ public class DefaultTimeBar extends View implements TimeBar {
     int defaultScrubberDraggedSize = dpToPx(density, DEFAULT_SCRUBBER_DRAGGED_SIZE_DP);
     if (timebarAttrs != null) {
       TypedArray a =
-          context.getTheme().obtainStyledAttributes(timebarAttrs, R.styleable.DefaultTimeBar, 0, 0);
+          context
+              .getTheme()
+              .obtainStyledAttributes(
+                  timebarAttrs, R.styleable.DefaultTimeBar, defStyleAttr, defStyleRes);
       try {
         scrubberDrawable = a.getDrawable(R.styleable.DefaultTimeBar_scrubber_drawable);
         if (scrubberDrawable != null) {
@@ -277,6 +296,7 @@ public class DefaultTimeBar extends View implements TimeBar {
             defaultBarHeight);
         touchTargetHeight = a.getDimensionPixelSize(R.styleable.DefaultTimeBar_touch_target_height,
             defaultTouchTargetHeight);
+        barGravity = a.getInt(R.styleable.DefaultTimeBar_bar_gravity, BAR_GRAVITY_CENTER);
         adMarkerWidth = a.getDimensionPixelSize(R.styleable.DefaultTimeBar_ad_marker_width,
             defaultAdMarkerWidth);
         scrubberEnabledSize = a.getDimensionPixelSize(
@@ -309,6 +329,7 @@ public class DefaultTimeBar extends View implements TimeBar {
     } else {
       barHeight = defaultBarHeight;
       touchTargetHeight = defaultTouchTargetHeight;
+      barGravity = BAR_GRAVITY_CENTER;
       adMarkerWidth = defaultAdMarkerWidth;
       scrubberEnabledSize = defaultScrubberEnabledSize;
       scrubberDisabledSize = defaultScrubberDisabledSize;
@@ -331,6 +352,13 @@ public class DefaultTimeBar extends View implements TimeBar {
           (Math.max(scrubberDisabledSize, Math.max(scrubberEnabledSize, scrubberDraggedSize)) + 1)
               / 2;
     }
+    scrubberScale = 1.0f;
+    scrubberScalingAnimator = new ValueAnimator();
+    scrubberScalingAnimator.addUpdateListener(
+        animation -> {
+          scrubberScale = (float) animation.getAnimatedValue();
+          invalidate(seekBounds);
+        });
     duration = C.TIME_UNSET;
     keyTimeIncrement = C.TIME_UNSET;
     keyCountIncrement = DEFAULT_INCREMENT_COUNT;
@@ -338,6 +366,44 @@ public class DefaultTimeBar extends View implements TimeBar {
     if (getImportantForAccessibility() == View.IMPORTANT_FOR_ACCESSIBILITY_AUTO) {
       setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES);
     }
+  }
+
+  /** Shows the scrubber handle. */
+  public void showScrubber() {
+    showScrubber(/* showAnimationDurationMs= */ 0);
+  }
+
+  /**
+   * Shows the scrubber handle with animation.
+   *
+   * @param showAnimationDurationMs The duration for scrubber showing animation.
+   */
+  public void showScrubber(long showAnimationDurationMs) {
+    if (scrubberScalingAnimator.isStarted()) {
+      scrubberScalingAnimator.cancel();
+    }
+    scrubberScalingAnimator.setFloatValues(scrubberScale, SHOWN_SCRUBBER_SCALE);
+    scrubberScalingAnimator.setDuration(showAnimationDurationMs);
+    scrubberScalingAnimator.start();
+  }
+
+  /** Hides the scrubber handle. */
+  public void hideScrubber() {
+    hideScrubber(/* hideAnimationDurationMs= */ 0);
+  }
+
+  /**
+   * Hides the scrubber handle with animation.
+   *
+   * @param hideAnimationDurationMs The duration for scrubber hiding animation.
+   */
+  public void hideScrubber(long hideAnimationDurationMs) {
+    if (scrubberScalingAnimator.isStarted()) {
+      scrubberScalingAnimator.cancel();
+    }
+    scrubberScalingAnimator.setFloatValues(scrubberScale, HIDDEN_SCRUBBER_SCALE);
+    scrubberScalingAnimator.setDuration(hideAnimationDurationMs);
+    scrubberScalingAnimator.start();
   }
 
   /**
@@ -408,6 +474,7 @@ public class DefaultTimeBar extends View implements TimeBar {
 
   @Override
   public void addListener(OnScrubListener listener) {
+    Assertions.checkNotNull(listener);
     listeners.add(listener);
   }
 
@@ -604,7 +671,14 @@ public class DefaultTimeBar extends View implements TimeBar {
     int barY = (height - touchTargetHeight) / 2;
     int seekLeft = getPaddingLeft();
     int seekRight = width - getPaddingRight();
-    int progressY = barY + (touchTargetHeight - barHeight) / 2;
+    int progressY;
+    if (barGravity == BAR_GRAVITY_BOTTOM) {
+      progressY = barY + touchTargetHeight - (getPaddingBottom() + scrubberPadding + barHeight / 2);
+    } else if (barGravity == BAR_GRAVITY_TOP) {
+      progressY = barY + getPaddingTop() + scrubberPadding - barHeight / 2;
+    } else {
+      progressY = barY + (touchTargetHeight - barHeight) / 2;
+    }
     seekBounds.set(seekLeft, barY, seekRight, barY + touchTargetHeight);
     progressBar.set(seekBounds.left + scrubberPadding, progressY,
         seekBounds.right - scrubberPadding, progressY + barHeight);
@@ -630,7 +704,6 @@ public class DefaultTimeBar extends View implements TimeBar {
     event.setClassName(ACCESSIBILITY_CLASS_NAME);
   }
 
-  @TargetApi(21)
   @Override
   public void onInitializeAccessibilityNodeInfo(AccessibilityNodeInfo info) {
     super.onInitializeAccessibilityNodeInfo(info);
@@ -755,10 +828,7 @@ public class DefaultTimeBar extends View implements TimeBar {
   }
 
   private Point resolveRelativeTouchPosition(MotionEvent motionEvent) {
-    getLocationOnScreen(locationOnScreen);
-    touchPosition.set(
-        ((int) motionEvent.getRawX()) - locationOnScreen[0],
-        ((int) motionEvent.getRawY()) - locationOnScreen[1]);
+    touchPosition.set((int) motionEvent.getX(), (int) motionEvent.getY());
     return touchPosition;
   }
 
@@ -820,11 +890,11 @@ public class DefaultTimeBar extends View implements TimeBar {
     if (scrubberDrawable == null) {
       int scrubberSize = (scrubbing || isFocused()) ? scrubberDraggedSize
           : (isEnabled() ? scrubberEnabledSize : scrubberDisabledSize);
-      int playheadRadius = scrubberSize / 2;
+      int playheadRadius = (int) ((scrubberSize * scrubberScale) / 2);
       canvas.drawCircle(playheadX, playheadY, playheadRadius, scrubberPaint);
     } else {
-      int scrubberDrawableWidth = scrubberDrawable.getIntrinsicWidth();
-      int scrubberDrawableHeight = scrubberDrawable.getIntrinsicHeight();
+      int scrubberDrawableWidth = (int) (scrubberDrawable.getIntrinsicWidth() * scrubberScale);
+      int scrubberDrawableHeight = (int) (scrubberDrawable.getIntrinsicHeight() * scrubberScale);
       scrubberDrawable.setBounds(
           playheadX - scrubberDrawableWidth / 2,
           playheadY - scrubberDrawableHeight / 2,
