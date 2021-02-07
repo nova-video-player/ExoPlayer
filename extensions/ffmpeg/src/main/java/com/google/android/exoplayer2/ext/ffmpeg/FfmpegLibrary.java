@@ -149,6 +149,8 @@ public final class FfmpegLibrary {
         return "h264";
       case MimeTypes.VIDEO_H265:
         return "hevc";
+      case MimeTypes.VIDEO_MP4V:
+        return "mpeg4";
       default:
         return null;
     }
